@@ -1,66 +1,40 @@
 /*
- * MooMacroLib.js — standalone, read-only page scanner for Moo Macro.
- * Version: 0.4.0
+ * MooMacroLib.js — standalone read-only page scan + one-shot Q input test.
+ * Version: 0.5.0
  *
- * Purpose:
- *   Inventory public page globals and visible game-page assets so we can
- *   determine whether the official page exposes a usable state interface.
- *
- * Safety / scope:
- *   - Does NOT require MooMod or MooMoo.js.
- *   - Does NOT invoke game helpers or read their function source.
- *   - Does NOT invoke game-page global getters; globals are inspected via
- *     own property descriptors only.
- *   - Does NOT inspect WebSocket objects, frames, packets, or socket traffic.
- *   - Lists already-loaded script URL metadata, but never fetches script bodies.
- *   - Does NOT dispatch keyboard/mouse events or send game actions.
+ * - No MooMod / MooMoo.js dependency.
+ * - No game-helper calls, socket inspection, packet decoding, or network requests.
+ * - Scan reads public window property descriptors and visible DOM metadata only.
+ * - Test Q dispatches one synthetic keydown + keyup pair for Q only.
+ *   Synthetic events are untrusted; the game may ignore them.
+ * - No Space key, Auto-Heal, timers, or repeated input are triggered.
  */
 (function (root, factory) {
   'use strict';
-
   const api = factory();
-
-  if (typeof module === 'object' && module.exports) {
-    module.exports = api;
-  } else {
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else {
     root.MooMacroLib = api;
     if (root && root.document) api.autoAttach(root);
   }
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const VERSION = '0.4.0';
+  const VERSION = '0.5.0';
   const ROOT_ID = 'moo-macro-root';
   const CARD_ID = 'moo-macro-standalone-scan';
-
-  const GLOBAL_HINT =
-    /(?:moomoo|game|player|health|inventory|items|weapons|self|state|store)/i;
-
-  const STATE_FIELD =
-    /^(?:health|hp|alive|sid|items|weapons|inventory|weaponIndex|weapon|food)$/i;
-
-  const HELPER_NAMES = [
-    'storeEquip',
-    'storeBuy',
-    'follmoo',
-    'showItemInfo',
-    'changeStoreIndex'
-  ];
+  const GLOBAL_HINT = /(?:moomoo|game|player|health|inventory|items|weapons|self|state|store)/i;
+  const STATE_FIELD = /^(?:health|hp|alive|sid|items|weapons|inventory|weaponIndex|weapon|food)$/i;
+  const HELPER_NAMES = ['storeEquip', 'storeBuy', 'follmoo', 'showItemInfo', 'changeStoreIndex'];
 
   function ownNames(value) {
-    try {
-      return Object.getOwnPropertyNames(value);
-    } catch (_) {
-      return [];
-    }
+    try { return Object.getOwnPropertyNames(value); }
+    catch (_) { return []; }
   }
 
   function ownDescriptor(value, key) {
-    try {
-      return Object.getOwnPropertyDescriptor(value, key);
-    } catch (_) {
-      return null;
-    }
+    try { return Object.getOwnPropertyDescriptor(value, key); }
+    catch (_) { return null; }
   }
 
   function describeValue(value) {
@@ -73,55 +47,26 @@
 
   function safeValue(value) {
     if (value === null) return 'null';
-
-    if (typeof value === 'string') {
-      return JSON.stringify(value.slice(0, 80));
-    }
-
-    if (typeof value === 'number' || typeof value === 'boolean') {
-      return String(value);
-    }
-
-    if (Array.isArray(value)) {
-      return '[array length ' + value.length + ']';
-    }
-
+    if (typeof value === 'string') return JSON.stringify(value.slice(0, 80));
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    if (Array.isArray(value)) return '[array length ' + value.length + ']';
     if (typeof value === 'function') return '[function]';
     if (typeof value === 'object') return '[object]';
-
     return String(value);
   }
 
   function readStateFields(objectValue) {
     const found = [];
-    let names;
-
-    try {
-      names = ownNames(objectValue);
-    } catch (_) {
-      return found;
-    }
-
-    names.slice(0, 100).forEach(function (field) {
+    ownNames(objectValue).slice(0, 100).forEach(function (field) {
       if (!STATE_FIELD.test(field)) return;
-
       const descriptor = ownDescriptor(objectValue, field);
       if (!descriptor) return;
-
       if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
-        found.push({
-          name: field,
-          value: '[accessor not invoked]'
-        });
-        return;
+        found.push({ name: field, value: '[accessor not invoked]' });
+      } else {
+        found.push({ name: field, value: safeValue(descriptor.value) });
       }
-
-      found.push({
-        name: field,
-        value: safeValue(descriptor.value)
-      });
     });
-
     return found;
   }
 
@@ -129,55 +74,38 @@
     const found = [];
     const seen = new Set();
 
+    function addUrl(value) {
+      let url = String(value || '');
+      if (!url) return;
+
+      try {
+        const parsed = new URL(
+          url,
+          win.location && win.location.href || 'https://moomoo.io/'
+        );
+        url = parsed.origin + parsed.pathname;
+      } catch (_) {}
+
+      if (!seen.has(url)) {
+        seen.add(url);
+        found.push(url);
+      }
+    }
+
     try {
       Array.from(win.document.scripts || []).forEach(function (script) {
-        if (!script || !script.src) return;
-
-        let src = String(script.src);
-
-        try {
-          const parsed = new URL(
-            src,
-            win.location && win.location.href || 'https://moomoo.io/'
-          );
-
-          src = parsed.origin + parsed.pathname;
-        } catch (_) {}
-
-        if (!seen.has(src)) {
-          seen.add(src);
-          found.push(src);
-        }
+        if (script && script.src) addUrl(script.src);
       });
     } catch (_) {}
 
-    // Lists URLs for already-loaded JavaScript resources only.
-    // It does not make requests or read response bodies.
     try {
-      const entries =
-        win.performance && win.performance.getEntriesByType
-          ? win.performance.getEntriesByType('resource')
-          : [];
+      const entries = win.performance && win.performance.getEntriesByType
+        ? win.performance.getEntriesByType('resource') : [];
 
       Array.from(entries || []).forEach(function (entry) {
-        let name = String(entry && entry.name || '');
-
-        if (!/\.m?js(?:[?#]|$)|\/p\/[^/?#]+\.js(?:[?#]|$)/i.test(name)) {
-          return;
-        }
-
-        try {
-          const parsed = new URL(
-            name,
-            win.location && win.location.href || 'https://moomoo.io/'
-          );
-
-          name = parsed.origin + parsed.pathname;
-        } catch (_) {}
-
-        if (!seen.has(name)) {
-          seen.add(name);
-          found.push(name);
+        const name = String(entry && entry.name || '');
+        if (/\.m?js(?:[?#]|$)|\/p\/[^/?#]+\.js(?:[?#]|$)/i.test(name)) {
+          addUrl(name);
         }
       });
     } catch (_) {}
@@ -191,140 +119,95 @@
     }
 
     const doc = win.document;
-    const hostname =
-      (win.location && win.location.hostname) || 'unknown';
-
+    const hostname = (win.location && win.location.hostname) || 'unknown';
     let page = 'unknown';
 
     try {
       page = win.location
         ? String(win.location.protocol || 'https:') +
-          '//' +
-          hostname +
+          '//' + hostname +
           String(win.location.pathname || '/')
         : 'unknown';
     } catch (_) {}
 
-    const isMooMooHost = /(^|\.)moomoo\.io$/i.test(hostname);
-
     let canvases = [];
     let globalNames = [];
-    let scriptUrls = [];
 
     try {
-      canvases = Array.from(doc.querySelectorAll('canvas')).map(
-        function (canvas, index) {
-          let rect = null;
+      canvases = Array.from(doc.querySelectorAll('canvas')).map(function (canvas, index) {
+        let rect = null;
 
-          try {
-            const bounds = canvas.getBoundingClientRect();
-
-            rect = {
-              x: Math.round(bounds.x),
-              y: Math.round(bounds.y),
-              width: Math.round(bounds.width),
-              height: Math.round(bounds.height)
-            };
-          } catch (_) {}
-
-          return {
-            index: index,
-            id: canvas.id || '',
-            width: Number(canvas.width) || 0,
-            height: Number(canvas.height) || 0,
-            rect: rect
+        try {
+          const bounds = canvas.getBoundingClientRect();
+          rect = {
+            x: Math.round(bounds.x),
+            y: Math.round(bounds.y),
+            width: Math.round(bounds.width),
+            height: Math.round(bounds.height)
           };
-        }
-      );
+        } catch (_) {}
+
+        return {
+          index,
+          id: canvas.id || '',
+          width: Number(canvas.width) || 0,
+          height: Number(canvas.height) || 0,
+          rect
+        };
+      });
     } catch (_) {}
 
-    try {
-      globalNames = ownNames(win);
-    } catch (_) {}
-
-    try {
-      scriptUrls = listScripts(win);
-    } catch (_) {}
+    try { globalNames = ownNames(win); } catch (_) {}
 
     const publicGlobals = [];
     const stateCandidates = [];
 
-    globalNames
-      .filter(function (name) {
-        return (
-          GLOBAL_HINT.test(name) &&
-          !/(?:socket|websocket|\bws\b|network|transport)/i.test(name)
-        );
-      })
-      .slice(0, 120)
-      .forEach(function (name) {
-        const descriptor = ownDescriptor(win, name);
-        if (!descriptor) return;
+    globalNames.filter(function (name) {
+      return GLOBAL_HINT.test(name) &&
+        !/(?:socket|websocket|\bws\b|network|transport)/i.test(name);
+    }).slice(0, 120).forEach(function (name) {
+      const descriptor = ownDescriptor(win, name);
+      if (!descriptor) return;
 
-        if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
-          publicGlobals.push({
-            name: name,
-            type: 'accessor (not invoked)'
-          });
+      if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+        publicGlobals.push({ name, type: 'accessor (not invoked)' });
+        return;
+      }
 
-          return;
-        }
+      const value = descriptor.value;
+      publicGlobals.push({ name, type: describeValue(value) });
 
-        const value = descriptor.value;
-
-        publicGlobals.push({
-          name: name,
-          type: describeValue(value)
+      if (STATE_FIELD.test(name)) {
+        stateCandidates.push({
+          name: 'window.' + name,
+          fields: [{ name, value: safeValue(value) }]
         });
+        return;
+      }
 
-        if (STATE_FIELD.test(name)) {
-          stateCandidates.push({
-            name: 'window.' + name,
-            fields: [{
-              name: name,
-              value: safeValue(value)
-            }]
-          });
+      if (!value || typeof value !== 'object' ||
+          !/(?:moo|game|player|self|state|inventory|items|weapons)/i.test(name)) {
+        return;
+      }
 
-          return;
-        }
-
-        if (
-          !value ||
-          typeof value !== 'object' ||
-          !/(?:moo|game|player|self|state|inventory|items|weapons)/i.test(name)
-        ) {
-          return;
-        }
-
-        const fields = readStateFields(value);
-
-        if (fields.length) {
-          stateCandidates.push({
-            name: name,
-            fields: fields
-          });
-        }
-      });
+      const fields = readStateFields(value);
+      if (fields.length) stateCandidates.push({ name, fields });
+    });
 
     const helpers = HELPER_NAMES.map(function (name) {
       const descriptor = ownDescriptor(win, name);
 
-      if (
-        !descriptor ||
-        !Object.prototype.hasOwnProperty.call(descriptor, 'value')
-      ) {
+      if (!descriptor ||
+          !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
         return {
-          name: name,
+          name,
           available: false,
-          type: descriptor
-            ? 'accessor (not invoked)'
-            : 'not exposed'
+          type: descriptor ? 'accessor (not invoked)' : 'not exposed'
         };
       }
 
       return {
-        name: name,
+        name,
         available: typeof descriptor.value === 'function',
         type: describeValue(descriptor.value)
       };
@@ -333,53 +216,45 @@
     let diedTextFound = false;
     let gameCanvasFound = false;
 
-    try {
-      diedTextFound = !!doc.querySelector('#diedText');
-    } catch (_) {}
+    try { diedTextFound = !!doc.querySelector('#diedText'); } catch (_) {}
+    try { gameCanvasFound = !!doc.querySelector('#gameCanvas'); } catch (_) {}
 
-    try {
-      gameCanvasFound = !!doc.querySelector('#gameCanvas');
-    } catch (_) {}
-
-    const hasHealthField = stateCandidates.some(function (candidate) {
-      return candidate.fields.some(function (field) {
-        return /^(health|hp)$/i.test(field.name);
-      });
-    });
+    const healthFound = stateCandidates.some(candidate =>
+      candidate.fields.some(field => /^(health|hp)$/i.test(field.name))
+    );
 
     return {
       libraryVersion: VERSION,
-      page: page,
-      hostname: hostname,
-      officialHostMatch: isMooMooHost,
+      page,
+      hostname,
+      officialHostMatch: /(^|\.)moomoo\.io$/i.test(hostname),
       readyState: doc.readyState || 'unknown',
 
       dom: {
         canvasCount: canvases.length,
-        canvases: canvases,
-        gameCanvasFound: gameCanvasFound,
-        diedTextFound: diedTextFound
+        canvases,
+        gameCanvasFound,
+        diedTextFound
       },
 
-      scriptUrls: scriptUrls,
-      publicGlobals: publicGlobals,
-      stateCandidates: stateCandidates,
+      scriptUrls: listScripts(win),
+      publicGlobals,
+      stateCandidates,
       knownHelpers: helpers,
-      publicHealthFieldFound: hasHealthField,
+      publicHealthFieldFound: healthFound,
 
       checks: {
         providerHandshakeAttempted: false,
         gameHelpersInvoked: false,
-        gameActionsSent: false,
+        gameActionsSentByLibrary: false,
         socketTrafficInspected: false,
         networkRequestsInitiated: false,
-        loadedScriptUrlMetadataListed: true,
         scriptBodiesFetched: false
       }
     };
   }
 
-  function formatReport(report) {
+  function formatReport(report, inputTest) {
     if (!report || typeof report !== 'object') {
       throw new TypeError('A scan report is required.');
     }
@@ -393,8 +268,7 @@
       'Document ready: ' + (report.readyState || 'unknown'),
       '',
       'VISIBLE GAME PAGE',
-      'Canvas count: ' +
-        ((report.dom && report.dom.canvasCount) || 0),
+      'Canvas count: ' + ((report.dom && report.dom.canvasCount) || 0),
       'gameCanvas element: ' +
         (report.dom && report.dom.gameCanvasFound ? 'found' : 'not found'),
       'diedText element: ' +
@@ -409,83 +283,165 @@
 
     (report.stateCandidates || []).forEach(function (candidate) {
       lines.push('  ' + candidate.name + ':');
-
       (candidate.fields || []).forEach(function (field) {
         lines.push('    ' + field.name + ' = ' + field.value);
       });
     });
 
     lines.push('', 'KNOWN EXPOSED HELPERS (NOT CALLED)');
-
     (report.knownHelpers || []).forEach(function (helper) {
       lines.push(
-        '  ' +
-          helper.name +
-          ': ' +
-          (helper.available ? 'function exposed' : helper.type)
+        '  ' + helper.name + ': ' +
+        (helper.available ? 'function exposed' : helper.type)
       );
     });
 
     lines.push('', 'MATCHING PUBLIC WINDOW PROPERTIES');
-
     (report.publicGlobals || []).forEach(function (item) {
       lines.push('  ' + item.name + ': ' + item.type);
     });
 
-    lines.push(
-      '',
-      'ALREADY-LOADED JAVASCRIPT URLS (NO FILES FETCHED)'
-    );
-
+    lines.push('', 'ALREADY-LOADED JAVASCRIPT URLS (NO FILES FETCHED)');
     (report.scriptUrls || []).forEach(function (url) {
       lines.push('  ' + url);
     });
+
+    lines.push('', 'TEST Q RESULT');
+
+    if (!inputTest) {
+      lines.push('Test Q has not been run.');
+    } else {
+      lines.push('Time: ' + inputTest.time);
+      lines.push('Result: ' + inputTest.message);
+      lines.push('Keydown dispatched: ' +
+        (inputTest.keydownDispatched ? 'YES' : 'NO'));
+      lines.push('Keyup dispatched: ' +
+        (inputTest.keyupDispatched ? 'YES' : 'NO'));
+      lines.push('Synthetic / isTrusted=false: ' +
+        (inputTest.synthetic ? 'YES' : 'NO'));
+      lines.push('Space key dispatched: NO');
+      lines.push('Game accepted the input: NOT CONFIRMED');
+    }
 
     lines.push(
       '',
       'SAFETY CHECKS',
       'Provider handshake attempted: NO',
       'Game helpers invoked: NO',
-      'Game actions sent: NO',
       'Socket frames / packet traffic inspected: NO',
       'New network requests initiated: NO',
-      'Already-loaded script URL metadata listed: YES',
       'Script source files fetched: NO',
+      'Auto-Heal triggered: NO',
       '',
       report.publicHealthFieldFound
-        ? 'Result: A public health-like field was found. It still needs careful validation before any feature can rely on it.'
-        : 'Result: No public player-health field was found in the inspected page globals. This scan cannot access module-private state.'
+        ? 'Scan result: A public health-like field was found. It still needs validation before any feature can rely on it.'
+        : 'Scan result: No public player-health field was found in the inspected page globals. This scan cannot access module-private state.'
     );
 
     return lines.join('\n');
   }
 
-  function removeCombatDiagnostic(shadow) {
-    const pane = shadow &&
-      shadow.querySelector('[data-pane="combat"]');
+  function dispatchTestQ(win) {
+    if (!win || !win.document || typeof win.KeyboardEvent !== 'function') {
+      return {
+        ok: false,
+        message: 'KeyboardEvent support is unavailable.',
+        keydownDispatched: false,
+        keyupDispatched: false,
+        synthetic: true
+      };
+    }
 
+    const doc = win.document;
+    const active = doc.activeElement;
+
+    if (active) {
+      const tag = String(active.tagName || '').toLowerCase();
+
+      if (tag === 'input' || tag === 'textarea' ||
+          tag === 'select' || active.isContentEditable === true) {
+        return {
+          ok: false,
+          message: 'Q was not sent because a text-entry field has focus.',
+          keydownDispatched: false,
+          keyupDispatched: false,
+          synthetic: true
+        };
+      }
+    }
+
+    const target = active && typeof active.dispatchEvent === 'function'
+      ? active
+      : (doc.body || doc.documentElement || doc);
+
+    if (!target || typeof target.dispatchEvent !== 'function') {
+      return {
+        ok: false,
+        message: 'No suitable page event target was found.',
+        keydownDispatched: false,
+        keyupDispatched: false,
+        synthetic: true
+      };
+    }
+
+    const init = {
+      key: 'q',
+      code: 'KeyQ',
+      keyCode: 81,
+      which: 81,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      repeat: false
+    };
+
+    try {
+      const down = new win.KeyboardEvent('keydown', init);
+      const downResult = target.dispatchEvent(down);
+
+      const up = new win.KeyboardEvent('keyup', init);
+      const upResult = target.dispatchEvent(up);
+
+      const tag = String(target.tagName || target.nodeName || 'page').toUpperCase();
+
+      return {
+        ok: true,
+        message:
+          'Synthetic Q keydown + keyup dispatched to ' + tag +
+          '. Watch the game to see whether it responds.',
+        keydownDispatched: true,
+        keyupDispatched: true,
+        synthetic: down.isTrusted === false && up.isTrusted === false,
+        defaultPrevented: {
+          keydown: !downResult,
+          keyup: !upResult
+        },
+        target: tag
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        message: 'Q dispatch failed: ' +
+          (error && error.message ? error.message : 'unknown error'),
+        keydownDispatched: false,
+        keyupDispatched: false,
+        synthetic: true
+      };
+    }
+  }
+
+  function removeCombatDiagnostic(shadow) {
+    const pane = shadow && shadow.querySelector('[data-pane="combat"]');
     if (!pane) return 0;
 
     const targets = new Set();
 
-    const matches = Array.from(pane.querySelectorAll('*')).filter(
-      function (element) {
-        const text = String(element.textContent || '').trim();
-        const isButton =
-          String(element.tagName || '').toLowerCase() === 'button';
-
-        return (
-          (isButton && /diagnostic|connection test|page scan/i.test(text)) ||
-          (
-            !element.children.length &&
-            /diagnostic section|connection diagnostic/i.test(text)
-          )
-        );
-      }
-    );
-
-    matches.forEach(function (element) {
-      let node = element;
+    Array.from(pane.querySelectorAll('button')).filter(function (button) {
+      return /diagnostic|connection test|page scan|read-only scan/i.test(
+        String(button.textContent || '').trim()
+      );
+    }).forEach(function (button) {
+      let node = button;
       let card = null;
 
       while (node && node !== pane) {
@@ -506,7 +462,7 @@
         node = node.parentElement;
       }
 
-      targets.add(card || element);
+      targets.add(card || button);
     });
 
     let removed = 0;
@@ -524,41 +480,31 @@
   function removeOldConnectionCard(logsPane) {
     if (!logsPane) return;
 
-    const oldMarked = logsPane.querySelectorAll(
+    Array.from(logsPane.querySelectorAll(
       '[data-moo-macro-connection-card], ' +
       '#moo-macro-connection-card, ' +
       '.moo-macro-connection-card'
-    );
-
-    Array.from(oldMarked).forEach(function (node) {
-      node.remove();
-    });
+    )).forEach(node => node.remove());
 
     const oldButton = Array.from(
       logsPane.querySelectorAll('button')
-    ).find(function (button) {
-      return /^check connection$/i.test(
-        String(button.textContent || '').trim()
-      );
-    });
+    ).find(button =>
+      /^check connection$/i.test(String(button.textContent || '').trim())
+    );
 
     if (oldButton) {
       const card =
         oldButton.closest('.stat, article, fieldset, [data-card]') ||
         oldButton.parentElement;
 
-      if (card && logsPane.contains(card)) {
-        card.remove();
-      }
+      if (card && logsPane.contains(card)) card.remove();
     }
   }
 
   function makeElement(doc, tag, className, text) {
     const element = doc.createElement(tag);
-
     if (className) element.className = className;
     if (text !== undefined) element.textContent = text;
-
     return element;
   }
 
@@ -572,16 +518,9 @@
     const logsPane = shadow.querySelector('[data-pane="logs"]');
     if (!logsPane) return false;
 
-    if (shadow.getElementById && shadow.getElementById(CARD_ID)) {
-      return true;
-    }
-
-    if (shadow.querySelector('#' + CARD_ID)) {
-      return true;
-    }
+    if (shadow.querySelector('#' + CARD_ID)) return true;
 
     const removed = removeCombatDiagnostic(shadow);
-
     removeOldConnectionCard(logsPane);
 
     const card = makeElement(doc, 'div', 'stat');
@@ -592,75 +531,51 @@
 
     style.textContent = [
       '#' + CARD_ID + '{margin-top:10px}',
-      '#' + CARD_ID + ' .mm-scan-title{font-weight:700;margin-bottom:5px}',
-      '#' + CARD_ID + ' .mm-scan-note{font-size:11px;color:#aebbd0;margin:5px 0 9px}',
-      '#' + CARD_ID + ' .mm-scan-actions{display:flex;gap:7px;margin:7px 0}',
-      '#' + CARD_ID + ' .mm-scan-actions button{flex:1;min-width:0}',
-      '#' + CARD_ID + ' .mm-scan-status{font-size:11px;color:#f6cd75;min-height:16px;margin:5px 0}',
-      '#' + CARD_ID + ' .mm-scan-log{max-height:105px;overflow:auto;background:#0b1220;border:1px solid #334155;border-radius:7px;padding:6px;font-size:11px}',
-      '#' + CARD_ID + ' .mm-scan-log div{padding:3px 0;border-bottom:1px solid #263449;overflow-wrap:anywhere}',
-      '#' + CARD_ID + ' .mm-scan-report{display:block;width:100%;height:105px;margin-top:7px;resize:vertical;background:#0b1220;color:#e5edf8;border:1px solid #334155;border-radius:7px;padding:6px;font:10px/1.35 monospace}'
+      '#' + CARD_ID + ' .mm-title{font-weight:700;margin-bottom:5px}',
+      '#' + CARD_ID + ' .mm-note{font-size:11px;color:#aebbd0;margin:5px 0 9px}',
+      '#' + CARD_ID + ' .mm-actions{display:flex;gap:7px;margin:7px 0}',
+      '#' + CARD_ID + ' .mm-actions button{flex:1;min-width:0}',
+      '#' + CARD_ID + ' .mm-status{font-size:11px;color:#f6cd75;min-height:30px;margin:5px 0;overflow-wrap:anywhere}',
+      '#' + CARD_ID + ' .mm-log{max-height:105px;overflow:auto;background:#0b1220;border:1px solid #334155;border-radius:7px;padding:6px;font-size:11px}',
+      '#' + CARD_ID + ' .mm-log div{padding:3px 0;border-bottom:1px solid #263449;overflow-wrap:anywhere}',
+      '#' + CARD_ID + ' .mm-report{display:block;width:100%;height:125px;margin-top:7px;resize:vertical;background:#0b1220;color:#e5edf8;border:1px solid #334155;border-radius:7px;padding:6px;font:10px/1.35 monospace}'
     ].join('\n');
 
     const title = makeElement(
-      doc,
-      'div',
-      'mm-scan-title',
-      'Standalone page scan'
+      doc, 'div', 'mm-title', 'Standalone connection tests'
     );
 
     const note = makeElement(
       doc,
       'p',
-      'mm-scan-note',
-      'Read-only check for public page state. No MooMod, game inputs, helper calls, or network inspection.'
+      'mm-note',
+      'Test Q sends one synthetic Q key press (keydown + keyup). It may select food. It never presses Space. The game may ignore synthetic input.'
     );
 
-    const actions = makeElement(doc, 'div', 'mm-scan-actions');
-
+    const actions = makeElement(doc, 'div', 'mm-actions');
+    const testButton = makeElement(doc, 'button', '', 'Test Q');
     const scanButton = makeElement(doc, 'button', '', 'Scan page');
     const copyButton = makeElement(doc, 'button', '', 'Copy report');
     const clearButton = makeElement(doc, 'button', '', 'Clear log');
 
-    copyButton.disabled = false;
-
-    actions.append(scanButton, copyButton, clearButton);
+    actions.append(testButton, scanButton, copyButton, clearButton);
 
     const status = makeElement(
-      doc,
-      'div',
-      'mm-scan-status',
-      'Ready. No scan has been run yet.'
+      doc, 'div', 'mm-status', 'Ready. Test Q has not been run.'
     );
 
-    const reportBox = makeElement(
-      doc,
-      'textarea',
-      'mm-scan-report'
-    );
-
+    const reportBox = makeElement(doc, 'textarea', 'mm-report');
     reportBox.readOnly = true;
-    reportBox.setAttribute(
-      'aria-label',
-      'Standalone page scan report'
-    );
-    reportBox.placeholder = 'The scan report will appear here.';
+    reportBox.setAttribute('aria-label', 'Moo Macro test report');
+    reportBox.placeholder = 'Scan and test results will appear here.';
 
-    const eventLog = makeElement(doc, 'div', 'mm-scan-log');
+    const eventLog = makeElement(doc, 'div', 'mm-log');
 
-    card.append(
-      style,
-      title,
-      note,
-      actions,
-      status,
-      reportBox,
-      eventLog
-    );
-
+    card.append(style, title, note, actions, status, reportBox, eventLog);
     logsPane.appendChild(card);
 
-    let latestReport = '';
+    let latestScan = null;
+    let latestInputTest = null;
     const events = [];
 
     function renderEvents() {
@@ -672,14 +587,12 @@
       }
 
       events.slice(-30).forEach(function (entry) {
-        const row = makeElement(
+        eventLog.appendChild(makeElement(
           doc,
           'div',
           '',
           '[' + entry.time + '] ' + entry.message
-        );
-
-        eventLog.appendChild(row);
+        ));
       });
     }
 
@@ -690,65 +603,78 @@
       });
 
       if (events.length > 50) events.shift();
-
       renderEvents();
     }
 
-    function fullReport() {
-      const parts = [
-        latestReport ||
-          [
-            'MOO MACRO — STANDALONE READ-ONLY PAGE SCAN',
+    function makeReport() {
+      const base = latestScan
+        ? formatReport(latestScan, latestInputTest)
+        : [
+            'MOO MACRO — STANDALONE TEST REPORT',
             'Library: ' + VERSION,
-            'No scan has been run yet.'
-          ].join('\n')
-      ];
+            'Page scan has not been run yet.',
+            '',
+            'TEST Q RESULT',
+            latestInputTest
+              ? latestInputTest.message
+              : 'Test Q has not been run.',
+            latestInputTest ? 'Space key dispatched: NO' : ''
+          ].filter(Boolean).join('\n');
 
-      parts.push('', 'EVENT LOG');
-
-      if (!events.length) {
-        parts.push('(empty)');
-      } else {
-        events.forEach(function (entry) {
-          parts.push(
-            '[' + entry.time + '] ' + entry.message
-          );
-        });
-      }
-
-      return parts.join('\n');
+      return base + '\n\nEVENT LOG\n' + (
+        events.length
+          ? events.map(entry =>
+              '[' + entry.time + '] ' + entry.message
+            ).join('\n')
+          : '(empty)'
+      );
     }
+
+    testButton.addEventListener('click', function () {
+      testButton.disabled = true;
+
+      try {
+        latestInputTest = Object.assign(
+          { time: new Date().toLocaleTimeString() },
+          dispatchTestQ(win)
+        );
+
+        status.textContent =
+          latestInputTest.message + ' Space was not sent.';
+
+        log(latestInputTest.ok
+          ? 'Test Q dispatched one synthetic Q keydown + keyup pair. No Space event was sent.'
+          : 'Test Q not dispatched: ' + latestInputTest.message);
+
+        reportBox.value = makeReport();
+      } finally {
+        testButton.disabled = false;
+      }
+    });
 
     scanButton.addEventListener('click', function () {
       try {
-        const report = scanPage(win);
+        latestScan = scanPage(win);
 
-        latestReport = formatReport(report);
-        reportBox.value = latestReport;
-
-        const candidateCount = report.stateCandidates.length;
-
-        status.textContent = report.publicHealthFieldFound
-          ? 'Scan complete: a public health-like field was found. Validation is still needed.'
+        status.textContent = latestScan.publicHealthFieldFound
+          ? 'Scan complete: a public health-like field was found; validation is still needed.'
           : 'Scan complete: no public health field found in public globals.';
 
         log('Read-only page scan completed.');
-        log('Candidate state objects: ' + candidateCount + '.');
-        log('No game actions or network inspection occurred.');
+        log('Candidate state objects: ' + latestScan.stateCandidates.length + '.');
+
+        reportBox.value = makeReport();
       } catch (error) {
-        status.textContent =
-          'Scan failed: ' +
+        status.textContent = 'Scan failed: ' +
           (error && error.message ? error.message : 'unknown error');
 
-        log(
-          'Scan failed: ' +
-          (error && error.message ? error.message : 'unknown error')
-        );
+        log('Scan failed: ' +
+          (error && error.message ? error.message : 'unknown error'));
       }
     });
 
     copyButton.addEventListener('click', async function () {
-      const report = fullReport();
+      const report = makeReport();
       reportBox.value = report;
 
       try {
@@ -757,48 +683,44 @@
           !win.navigator.clipboard ||
           typeof win.navigator.clipboard.writeText !== 'function'
         ) {
-          throw new Error(
-            'Clipboard API is unavailable. The report is shown in the text box.'
-          );
+          throw new Error('Clipboard API unavailable.');
         }
 
         await win.navigator.clipboard.writeText(report);
-
         status.textContent = 'Report copied.';
         log('Report copied to clipboard.');
-      } catch (error) {
+      } catch (_) {
         reportBox.focus();
         reportBox.select();
 
         status.textContent =
-          'Copy unavailable. The report is selected below; press Ctrl+C.';
+          'Clipboard copy unavailable. Report selected below; press Ctrl+C.';
 
-        log(
-          'Clipboard copy unavailable; report selected for manual copying.'
-        );
+        log('Clipboard copy unavailable; report selected for manual copying.');
       }
     });
 
     clearButton.addEventListener('click', function () {
       events.length = 0;
       renderEvents();
-      status.textContent = 'Log cleared.';
+
+      status.textContent =
+        'Log cleared. Previous scan and Q result remain available in the report.';
+
+      reportBox.value = makeReport();
     });
 
-    log('Moo Macro standalone scanner ' + VERSION + ' ready.');
-
-    if (removed) {
-      log('Removed ' + removed + ' Combat diagnostic card(s).');
-    } else {
-      log('No Combat diagnostic card found to remove.');
-    }
+    log('Moo Macro standalone test library ' + VERSION + ' ready.');
+    log(removed
+      ? 'Removed ' + removed + ' Combat diagnostic card(s).'
+      : 'No Combat diagnostic card found to remove.'
+    );
 
     return true;
   }
 
   function autoAttach(win) {
     if (!win || !win.document) return false;
-
     if (mount(win)) return true;
 
     const doc = win.document;
@@ -817,7 +739,6 @@
         childList: true,
         subtree: true
       });
-
       return true;
     } catch (_) {
       observer.disconnect();
@@ -827,10 +748,11 @@
 
   return Object.freeze({
     version: VERSION,
-    scanPage: scanPage,
-    formatReport: formatReport,
-    removeCombatDiagnostic: removeCombatDiagnostic,
-    mount: mount,
-    autoAttach: autoAttach
+    scanPage,
+    formatReport,
+    dispatchTestQ,
+    removeCombatDiagnostic,
+    mount,
+    autoAttach
   });
 });
