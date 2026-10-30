@@ -1,366 +1,836 @@
-
-/* MooMacroLib.js — read-only API connection test v0.3.1
- * Uses the existing moomoo.js:api handshake. Sends no game actions.
+/*
+ * MooMacroLib.js — standalone, read-only page scanner for Moo Macro.
+ * Version: 0.4.0
+ *
+ * Purpose:
+ *   Inventory public page globals and visible game-page assets so we can
+ *   determine whether the official page exposes a usable state interface.
+ *
+ * Safety / scope:
+ *   - Does NOT require MooMod or MooMoo.js.
+ *   - Does NOT invoke game helpers or read their function source.
+ *   - Does NOT invoke game-page global getters; globals are inspected via
+ *     own property descriptors only.
+ *   - Does NOT inspect WebSocket objects, frames, packets, or socket traffic.
+ *   - Lists already-loaded script URL metadata, but never fetches script bodies.
+ *   - Does NOT dispatch keyboard/mouse events or send game actions.
  */
-(() => {
+(function (root, factory) {
   'use strict';
 
-  const VERSION = '0.3.1';
-  const API_EVENT = 'moomoo.js:api';
-  const CARD_ID = 'moo-macro-api-status';
-  const logs = [];
-  const unsubscribers = [];
-  let game = null, loader = null, busy = false, errorText = '';
-  let lastEvent = 'Not checked yet.';
-  let statusEl, reportEl, logEl, connectBtn, copyBtn, clearBtn;
-  let shadowObserver = null;
+  const api = factory();
 
-  const safe = (fn, fallback = null) => {
-    try { return fn(); } catch (_) { return fallback; }
-  };
+  if (typeof module === 'object' && module.exports) {
+    module.exports = api;
+  } else {
+    root.MooMacroLib = api;
+    if (root && root.document) api.autoAttach(root);
+  }
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
 
-  function state() {
-    if (!game) return { apiFound: false, ready: false };
-    const me = safe(() => game.self, {}) || {};
-    const transport = loader ? safe(() => loader.active(), null) : null;
+  const VERSION = '0.4.0';
+  const ROOT_ID = 'moo-macro-root';
+  const CARD_ID = 'moo-macro-standalone-scan';
+
+  const GLOBAL_HINT =
+    /(?:moomoo|game|player|health|inventory|items|weapons|self|state|store)/i;
+
+  const STATE_FIELD =
+    /^(?:health|hp|alive|sid|items|weapons|inventory|weaponIndex|weapon|food)$/i;
+
+  const HELPER_NAMES = [
+    'storeEquip',
+    'storeBuy',
+    'follmoo',
+    'showItemInfo',
+    'changeStoreIndex'
+  ];
+
+  function ownNames(value) {
+    try {
+      return Object.getOwnPropertyNames(value);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function ownDescriptor(value, key) {
+    try {
+      return Object.getOwnPropertyDescriptor(value, key);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function describeValue(value) {
+    if (value === null) return 'null';
+    if (Array.isArray(value)) return 'array(' + value.length + ')';
+    if (typeof value === 'function') return 'function';
+    if (typeof value === 'object') return 'object';
+    return typeof value;
+  }
+
+  function safeValue(value) {
+    if (value === null) return 'null';
+
+    if (typeof value === 'string') {
+      return JSON.stringify(value.slice(0, 80));
+    }
+
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+
+    if (Array.isArray(value)) {
+      return '[array length ' + value.length + ']';
+    }
+
+    if (typeof value === 'function') return '[function]';
+    if (typeof value === 'object') return '[object]';
+
+    return String(value);
+  }
+
+  function readStateFields(objectValue) {
+    const found = [];
+    let names;
+
+    try {
+      names = ownNames(objectValue);
+    } catch (_) {
+      return found;
+    }
+
+    names.slice(0, 100).forEach(function (field) {
+      if (!STATE_FIELD.test(field)) return;
+
+      const descriptor = ownDescriptor(objectValue, field);
+      if (!descriptor) return;
+
+      if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+        found.push({
+          name: field,
+          value: '[accessor not invoked]'
+        });
+        return;
+      }
+
+      found.push({
+        name: field,
+        value: safeValue(descriptor.value)
+      });
+    });
+
+    return found;
+  }
+
+  function listScripts(win) {
+    const found = [];
+    const seen = new Set();
+
+    try {
+      Array.from(win.document.scripts || []).forEach(function (script) {
+        if (!script || !script.src) return;
+
+        let src = String(script.src);
+
+        try {
+          const parsed = new URL(
+            src,
+            win.location && win.location.href || 'https://moomoo.io/'
+          );
+
+          src = parsed.origin + parsed.pathname;
+        } catch (_) {}
+
+        if (!seen.has(src)) {
+          seen.add(src);
+          found.push(src);
+        }
+      });
+    } catch (_) {}
+
+    // Lists URLs for already-loaded JavaScript resources only.
+    // It does not make requests or read response bodies.
+    try {
+      const entries =
+        win.performance && win.performance.getEntriesByType
+          ? win.performance.getEntriesByType('resource')
+          : [];
+
+      Array.from(entries || []).forEach(function (entry) {
+        let name = String(entry && entry.name || '');
+
+        if (!/\.m?js(?:[?#]|$)|\/p\/[^/?#]+\.js(?:[?#]|$)/i.test(name)) {
+          return;
+        }
+
+        try {
+          const parsed = new URL(
+            name,
+            win.location && win.location.href || 'https://moomoo.io/'
+          );
+
+          name = parsed.origin + parsed.pathname;
+        } catch (_) {}
+
+        if (!seen.has(name)) {
+          seen.add(name);
+          found.push(name);
+        }
+      });
+    } catch (_) {}
+
+    return found.slice(0, 40);
+  }
+
+  function scanPage(win) {
+    if (!win || !win.document) {
+      throw new TypeError('A browser window is required.');
+    }
+
+    const doc = win.document;
+    const hostname =
+      (win.location && win.location.hostname) || 'unknown';
+
+    let page = 'unknown';
+
+    try {
+      page = win.location
+        ? String(win.location.protocol || 'https:') +
+          '//' +
+          hostname +
+          String(win.location.pathname || '/')
+        : 'unknown';
+    } catch (_) {}
+
+    const isMooMooHost = /(^|\.)moomoo\.io$/i.test(hostname);
+
+    let canvases = [];
+    let globalNames = [];
+    let scriptUrls = [];
+
+    try {
+      canvases = Array.from(doc.querySelectorAll('canvas')).map(
+        function (canvas, index) {
+          let rect = null;
+
+          try {
+            const bounds = canvas.getBoundingClientRect();
+
+            rect = {
+              x: Math.round(bounds.x),
+              y: Math.round(bounds.y),
+              width: Math.round(bounds.width),
+              height: Math.round(bounds.height)
+            };
+          } catch (_) {}
+
+          return {
+            index: index,
+            id: canvas.id || '',
+            width: Number(canvas.width) || 0,
+            height: Number(canvas.height) || 0,
+            rect: rect
+          };
+        }
+      );
+    } catch (_) {}
+
+    try {
+      globalNames = ownNames(win);
+    } catch (_) {}
+
+    try {
+      scriptUrls = listScripts(win);
+    } catch (_) {}
+
+    const publicGlobals = [];
+    const stateCandidates = [];
+
+    globalNames
+      .filter(function (name) {
+        return (
+          GLOBAL_HINT.test(name) &&
+          !/(?:socket|websocket|\bws\b|network|transport)/i.test(name)
+        );
+      })
+      .slice(0, 120)
+      .forEach(function (name) {
+        const descriptor = ownDescriptor(win, name);
+        if (!descriptor) return;
+
+        if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+          publicGlobals.push({
+            name: name,
+            type: 'accessor (not invoked)'
+          });
+
+          return;
+        }
+
+        const value = descriptor.value;
+
+        publicGlobals.push({
+          name: name,
+          type: describeValue(value)
+        });
+
+        if (STATE_FIELD.test(name)) {
+          stateCandidates.push({
+            name: 'window.' + name,
+            fields: [{
+              name: name,
+              value: safeValue(value)
+            }]
+          });
+
+          return;
+        }
+
+        if (
+          !value ||
+          typeof value !== 'object' ||
+          !/(?:moo|game|player|self|state|inventory|items|weapons)/i.test(name)
+        ) {
+          return;
+        }
+
+        const fields = readStateFields(value);
+
+        if (fields.length) {
+          stateCandidates.push({
+            name: name,
+            fields: fields
+          });
+        }
+      });
+
+    const helpers = HELPER_NAMES.map(function (name) {
+      const descriptor = ownDescriptor(win, name);
+
+      if (
+        !descriptor ||
+        !Object.prototype.hasOwnProperty.call(descriptor, 'value')
+      ) {
+        return {
+          name: name,
+          available: false,
+          type: descriptor
+            ? 'accessor (not invoked)'
+            : 'not exposed'
+        };
+      }
+
+      return {
+        name: name,
+        available: typeof descriptor.value === 'function',
+        type: describeValue(descriptor.value)
+      };
+    });
+
+    let diedTextFound = false;
+    let gameCanvasFound = false;
+
+    try {
+      diedTextFound = !!doc.querySelector('#diedText');
+    } catch (_) {}
+
+    try {
+      gameCanvasFound = !!doc.querySelector('#gameCanvas');
+    } catch (_) {}
+
+    const hasHealthField = stateCandidates.some(function (candidate) {
+      return candidate.fields.some(function (field) {
+        return /^(health|hp)$/i.test(field.name);
+      });
+    });
+
     return {
-      apiFound: true,
-      ready: safe(() => game.isReady() === true, false),
-      transport: !transport ? 'unknown / inactive' :
-        transport.failed ? 'failed' : transport.ready ? 'ready' : 'not ready',
-      alive: typeof me.alive === 'boolean' ? me.alive : null,
-      sid: Number.isFinite(me.sid) && me.sid >= 0 ? me.sid : null,
-      health: Number.isFinite(me.health) ? me.health : null,
-      items: Array.isArray(me.items) ? me.items.slice() : [],
-      weapons: Array.isArray(me.weapons) ? me.weapons.slice() : [],
-      weaponIndex: Number.isFinite(me.weaponIndex) ? me.weaponIndex : null
+      libraryVersion: VERSION,
+      page: page,
+      hostname: hostname,
+      officialHostMatch: isMooMooHost,
+      readyState: doc.readyState || 'unknown',
+
+      dom: {
+        canvasCount: canvases.length,
+        canvases: canvases,
+        gameCanvasFound: gameCanvasFound,
+        diedTextFound: diedTextFound
+      },
+
+      scriptUrls: scriptUrls,
+      publicGlobals: publicGlobals,
+      stateCandidates: stateCandidates,
+      knownHelpers: helpers,
+      publicHealthFieldFound: hasHealthField,
+
+      checks: {
+        providerHandshakeAttempted: false,
+        gameHelpersInvoked: false,
+        gameActionsSent: false,
+        socketTrafficInspected: false,
+        networkRequestsInitiated: false,
+        loadedScriptUrlMetadataListed: true,
+        scriptBodiesFetched: false
+      }
     };
   }
 
-  function makeReport() {
-    const s = state();
-    return [
-      'MOO MACRO — API CONNECTION REPORT',
-      'Library: ' + VERSION,
-      'API found: ' + !!s.apiFound,
-      'Runtime ready: ' + !!s.ready,
-      'Transport: ' + (s.transport || 'unknown'),
-      'Alive: ' + (s.alive ?? 'unknown'),
-      'Player SID: ' + (s.sid ?? 'unknown'),
-      'Health: ' + (s.health ?? 'unknown'),
-      'Food/items: ' + JSON.stringify(s.items || []),
-      'Weapons: ' + JSON.stringify(s.weapons || []),
-      'Weapon index: ' + (s.weaponIndex ?? 'unknown'),
-      'Last event: ' + lastEvent,
-      'Connection error: ' + (errorText || 'none'),
+  function formatReport(report) {
+    if (!report || typeof report !== 'object') {
+      throw new TypeError('A scan report is required.');
+    }
+
+    const lines = [
+      'MOO MACRO — STANDALONE READ-ONLY PAGE SCAN',
+      'Library: ' + (report.libraryVersion || VERSION),
+      'Page: ' + (report.page || 'unknown'),
+      'Official MooMoo.io host match: ' +
+        (report.officialHostMatch ? 'YES' : 'NO / UNKNOWN'),
+      'Document ready: ' + (report.readyState || 'unknown'),
+      '',
+      'VISIBLE GAME PAGE',
+      'Canvas count: ' +
+        ((report.dom && report.dom.canvasCount) || 0),
+      'gameCanvas element: ' +
+        (report.dom && report.dom.gameCanvasFound ? 'found' : 'not found'),
+      'diedText element: ' +
+        (report.dom && report.dom.diedTextFound ? 'found' : 'not found'),
+      '',
+      'PUBLIC PLAYER-STATE CHECK',
+      'Public health field found: ' +
+        (report.publicHealthFieldFound ? 'YES' : 'NO'),
+      'Candidate state objects: ' +
+        ((report.stateCandidates && report.stateCandidates.length) || 0)
+    ];
+
+    (report.stateCandidates || []).forEach(function (candidate) {
+      lines.push('  ' + candidate.name + ':');
+
+      (candidate.fields || []).forEach(function (field) {
+        lines.push('    ' + field.name + ' = ' + field.value);
+      });
+    });
+
+    lines.push('', 'KNOWN EXPOSED HELPERS (NOT CALLED)');
+
+    (report.knownHelpers || []).forEach(function (helper) {
+      lines.push(
+        '  ' +
+          helper.name +
+          ': ' +
+          (helper.available ? 'function exposed' : helper.type)
+      );
+    });
+
+    lines.push('', 'MATCHING PUBLIC WINDOW PROPERTIES');
+
+    (report.publicGlobals || []).forEach(function (item) {
+      lines.push('  ' + item.name + ': ' + item.type);
+    });
+
+    lines.push(
+      '',
+      'ALREADY-LOADED JAVASCRIPT URLS (NO FILES FETCHED)'
+    );
+
+    (report.scriptUrls || []).forEach(function (url) {
+      lines.push('  ' + url);
+    });
+
+    lines.push(
+      '',
+      'SAFETY CHECKS',
+      'Provider handshake attempted: NO',
+      'Game helpers invoked: NO',
       'Game actions sent: NO',
-      '', 'EVENT LOG',
-      ...(logs.length ? logs.slice().reverse() : ['(empty)'])
-    ].join('\n');
-  }
-
-  function render() {
-    if (!statusEl || !reportEl) return;
-    const s = state();
-    statusEl.textContent = busy ? 'Checking connection…' :
-      !s.apiFound ? (errorText ? 'API NOT FOUND' : 'NOT CONNECTED') :
-      s.ready ? 'API CONNECTED · GAME READY' : 'API FOUND · WAITING FOR GAME';
-    reportEl.textContent = makeReport();
-    logEl.textContent = logs.length ? logs.join('\n') : 'No connection events yet.';
-    connectBtn.disabled = busy;
-
-    // Always allow copying, even when the API lookup failed.
-    copyBtn.disabled = false;
-    clearBtn.disabled = logs.length === 0;
-  }
-
-  function log(message) {
-    lastEvent = String(message);
-    logs.unshift('[' + new Date().toLocaleTimeString() + '] ' + lastEvent);
-    if (logs.length > 40) logs.length = 40;
-    render();
-  }
-
-  function validApi(api, apiLoader) {
-    return !!api && !!api.self &&
-      typeof api.on === 'function' &&
-      typeof api.onReady === 'function' &&
-      typeof api.isReady === 'function' &&
-      !!apiLoader && typeof apiLoader.active === 'function';
-  }
-
-  function requestApi(timeout = 600) {
-    return new Promise((resolve, reject) => {
-      let done = false;
-      const timer = window.setTimeout(() => {
-        if (done) return;
-        done = true;
-        reject(new Error(
-          'No response to "moomoo.js:api". The provider may not be loaded in this page context.'
-        ));
-      }, timeout);
-
-      try {
-        window.dispatchEvent(new window.CustomEvent(API_EVENT, {
-          detail: {
-            resolve(api, apiLoader) {
-              if (done) return;
-              done = true;
-              window.clearTimeout(timer);
-              if (!validApi(api, apiLoader)) {
-                reject(new Error(
-                  'API replied, but required read-only methods were missing.'
-                ));
-              } else resolve({ api, apiLoader });
-            }
-          }
-        }));
-      } catch (error) {
-        window.clearTimeout(timer);
-        reject(error);
-      }
-    });
-  }
-
-  function listen() {
-    const healthOff = game.on('health', event => {
-      if (event && event.sid === game.self.sid) {
-        log('Your health changed: ' + event.value);
-      }
-    });
-
-    const inventoryOff = game.on('inventory', event =>
-      log('Inventory updated: ' +
-        (event && event.isWeapon ? 'weapons' : 'food/items'))
+      'Socket frames / packet traffic inspected: NO',
+      'New network requests initiated: NO',
+      'Already-loaded script URL metadata listed: YES',
+      'Script source files fetched: NO',
+      '',
+      report.publicHealthFieldFound
+        ? 'Result: A public health-like field was found. It still needs careful validation before any feature can rely on it.'
+        : 'Result: No public player-health field was found in the inspected page globals. This scan cannot access module-private state.'
     );
 
-    const deathOff = game.on('died', () =>
-      log('Player death event received.')
-    );
-
-    [healthOff, inventoryOff, deathOff].forEach(fn => {
-      if (typeof fn === 'function') unsubscribers.push(fn);
-    });
-
-    game.onReady(() => log('Game runtime reports ready.'));
+    return lines.join('\n');
   }
 
-  async function connect() {
-    if (game) {
-      errorText = '';
-      log('Existing API connection checked.');
-      return state();
-    }
-
-    if (busy) return state();
-
-    busy = true;
-    errorText = '';
-    log('Looking for the existing MooMoo.js API…');
-
-    try {
-      let found = null, lastError = null;
-
-      for (let i = 0; i < 3; i++) {
-        try {
-          found = await requestApi(600);
-          break;
-        } catch (error) {
-          lastError = error;
-          if (i < 2) {
-            await new Promise(resolve => setTimeout(resolve, 200));
-          }
-        }
-      }
-
-      if (!found) {
-        throw lastError || new Error('MooMoo.js API was not found.');
-      }
-
-      game = found.api;
-      loader = found.apiLoader;
-      listen();
-      log('Read-only API handshake succeeded.');
-      return state();
-
-    } catch (error) {
-      errorText = error && error.message ? error.message : String(error);
-      log('Connection failed: ' + errorText);
-      throw error;
-
-    } finally {
-      busy = false;
-      render();
-    }
-  }
-
-  async function copyReport() {
-    const text = makeReport();
-
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const area = document.createElement('textarea');
-        area.value = text;
-        area.readOnly = true;
-        area.style.cssText =
-          'position:fixed;left:-9999px;top:0;opacity:0;';
-        document.body.appendChild(area);
-        area.select();
-        const ok = document.execCommand('copy');
-        area.remove();
-        if (!ok) throw new Error('Clipboard copy was blocked.');
-      }
-
-      copyBtn.textContent = 'Copied';
-
-    } catch (error) {
-      copyBtn.textContent = 'Copy unavailable';
-      log('Could not copy report: ' + (error.message || String(error)));
-    }
-  }
-
-  function clearLog() {
-    logs.length = 0;
-    lastEvent = 'Log cleared by user.';
-    render();
-
-    // Preserve the connection error in the report.
-  }
-
-  // Remove only the Run Diagnostic button from Combat.
   function removeCombatDiagnostic(shadow) {
-    const pane = shadow && shadow.querySelector('[data-pane="combat"]');
-    if (!pane) return;
+    const pane = shadow &&
+      shadow.querySelector('[data-pane="combat"]');
 
-    pane.querySelectorAll('button').forEach(button => {
-      const label = (button.textContent || '')
-        .replace(/\s+/g, ' ').trim();
+    if (!pane) return 0;
 
-      if (/^run\s+(?:(?:connection|api)\s+)?diagnostic$/i.test(label)) {
-        const parent = button.parentElement;
-        button.remove();
+    const targets = new Set();
 
-        if (parent &&
-            parent.matches('.stat, .mm-note') &&
-            !parent.textContent.trim()) {
-          parent.remove();
+    const matches = Array.from(pane.querySelectorAll('*')).filter(
+      function (element) {
+        const text = String(element.textContent || '').trim();
+        const isButton =
+          String(element.tagName || '').toLowerCase() === 'button';
+
+        return (
+          (isButton && /diagnostic|connection test|page scan/i.test(text)) ||
+          (
+            !element.children.length &&
+            /diagnostic section|connection diagnostic/i.test(text)
+          )
+        );
+      }
+    );
+
+    matches.forEach(function (element) {
+      let node = element;
+      let card = null;
+
+      while (node && node !== pane) {
+        const tag = String(node.tagName || '').toLowerCase();
+        const className =
+          typeof node.className === 'string' ? node.className : '';
+
+        if (
+          /(^|\s)stat(\s|$)|(^|\s)card(\s|$)/i.test(className) ||
+          tag === 'article' ||
+          tag === 'fieldset' ||
+          node.hasAttribute('data-diagnostic')
+        ) {
+          card = node;
+          break;
         }
+
+        node = node.parentElement;
+      }
+
+      targets.add(card || element);
+    });
+
+    let removed = 0;
+
+    targets.forEach(function (node) {
+      if (node && node !== pane && pane.contains(node)) {
+        node.remove();
+        removed += 1;
       }
     });
+
+    return removed;
   }
 
-  function attachLogs() {
-    const host = document.getElementById('moo-macro-root');
+  function removeOldConnectionCard(logsPane) {
+    if (!logsPane) return;
+
+    const oldMarked = logsPane.querySelectorAll(
+      '[data-moo-macro-connection-card], ' +
+      '#moo-macro-connection-card, ' +
+      '.moo-macro-connection-card'
+    );
+
+    Array.from(oldMarked).forEach(function (node) {
+      node.remove();
+    });
+
+    const oldButton = Array.from(
+      logsPane.querySelectorAll('button')
+    ).find(function (button) {
+      return /^check connection$/i.test(
+        String(button.textContent || '').trim()
+      );
+    });
+
+    if (oldButton) {
+      const card =
+        oldButton.closest('.stat, article, fieldset, [data-card]') ||
+        oldButton.parentElement;
+
+      if (card && logsPane.contains(card)) {
+        card.remove();
+      }
+    }
+  }
+
+  function makeElement(doc, tag, className, text) {
+    const element = doc.createElement(tag);
+
+    if (className) element.className = className;
+    if (text !== undefined) element.textContent = text;
+
+    return element;
+  }
+
+  function mount(win) {
+    const doc = win.document;
+    const host = doc.getElementById(ROOT_ID);
     const shadow = host && host.shadowRoot;
+
     if (!shadow) return false;
 
-    removeCombatDiagnostic(shadow);
+    const logsPane = shadow.querySelector('[data-pane="logs"]');
+    if (!logsPane) return false;
 
-    const pane = shadow.querySelector('[data-pane="logs"]');
-    if (!pane || shadow.querySelector('#' + CARD_ID)) return !!pane;
+    if (shadow.getElementById && shadow.getElementById(CARD_ID)) {
+      return true;
+    }
 
-    const card = document.createElement('div');
+    if (shadow.querySelector('#' + CARD_ID)) {
+      return true;
+    }
+
+    const removed = removeCombatDiagnostic(shadow);
+
+    removeOldConnectionCard(logsPane);
+
+    const card = makeElement(doc, 'div', 'stat');
     card.id = CARD_ID;
-    card.className = 'stat';
+    card.setAttribute('data-moo-macro-standalone-scan', 'true');
 
-    const title = document.createElement('strong');
-    title.textContent = 'Game API connection';
+    const style = makeElement(doc, 'style');
 
-    statusEl = document.createElement('p');
-    statusEl.className = 'note';
+    style.textContent = [
+      '#' + CARD_ID + '{margin-top:10px}',
+      '#' + CARD_ID + ' .mm-scan-title{font-weight:700;margin-bottom:5px}',
+      '#' + CARD_ID + ' .mm-scan-note{font-size:11px;color:#aebbd0;margin:5px 0 9px}',
+      '#' + CARD_ID + ' .mm-scan-actions{display:flex;gap:7px;margin:7px 0}',
+      '#' + CARD_ID + ' .mm-scan-actions button{flex:1;min-width:0}',
+      '#' + CARD_ID + ' .mm-scan-status{font-size:11px;color:#f6cd75;min-height:16px;margin:5px 0}',
+      '#' + CARD_ID + ' .mm-scan-log{max-height:105px;overflow:auto;background:#0b1220;border:1px solid #334155;border-radius:7px;padding:6px;font-size:11px}',
+      '#' + CARD_ID + ' .mm-scan-log div{padding:3px 0;border-bottom:1px solid #263449;overflow-wrap:anywhere}',
+      '#' + CARD_ID + ' .mm-scan-report{display:block;width:100%;height:105px;margin-top:7px;resize:vertical;background:#0b1220;color:#e5edf8;border:1px solid #334155;border-radius:7px;padding:6px;font:10px/1.35 monospace}'
+    ].join('\n');
 
-    const note = document.createElement('p');
-    note.className = 'note';
-    note.textContent =
-      'Read-only check. No food selection, attacks, or other game actions.';
-
-    const actions = document.createElement('div');
-    actions.className = 'actions';
-
-    connectBtn = document.createElement('button');
-    connectBtn.textContent = 'Check connection';
-    connectBtn.addEventListener('click', () =>
-      connect().catch(() => {})
+    const title = makeElement(
+      doc,
+      'div',
+      'mm-scan-title',
+      'Standalone page scan'
     );
 
-    copyBtn = document.createElement('button');
-    copyBtn.textContent = 'Copy report';
-    copyBtn.addEventListener('click', copyReport);
-
-    clearBtn = document.createElement('button');
-    clearBtn.textContent = 'Clear log';
-    clearBtn.addEventListener('click', clearLog);
-
-    actions.append(connectBtn, copyBtn, clearBtn);
-
-    reportEl = document.createElement('pre');
-    reportEl.style.cssText =
-      'white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;' +
-      'overflow:auto;padding:9px;background:#0b1220;color:#dbe5f2;' +
-      'border-radius:7px;font:11px/1.45 monospace;';
-
-    const eventTitle = document.createElement('strong');
-    eventTitle.textContent = 'Connection log';
-    eventTitle.style.display = 'block';
-    eventTitle.style.marginTop = '9px';
-
-    logEl = document.createElement('pre');
-    logEl.style.cssText =
-      'white-space:pre-wrap;overflow-wrap:anywhere;max-height:130px;' +
-      'overflow:auto;padding:9px;background:#0b1220;color:#dbe5f2;' +
-      'border-radius:7px;font:11px/1.45 monospace;';
-
-    card.append(title, statusEl, note, actions, reportEl, eventTitle, logEl);
-
-    const oldLogs = pane.querySelector(
-      '#logs, .logs, #mm-log-list, .mm-log-list'
+    const note = makeElement(
+      doc,
+      'p',
+      'mm-scan-note',
+      'Read-only check for public page state. No MooMod, game inputs, helper calls, or network inspection.'
     );
 
-    if (oldLogs) oldLogs.insertAdjacentElement('afterend', card);
-    else pane.appendChild(card);
+    const actions = makeElement(doc, 'div', 'mm-scan-actions');
 
-    if (!shadowObserver) {
-      shadowObserver = new MutationObserver(() =>
-        removeCombatDiagnostic(shadow)
-      );
-      shadowObserver.observe(shadow, {
-        childList: true,
-        subtree: true
+    const scanButton = makeElement(doc, 'button', '', 'Scan page');
+    const copyButton = makeElement(doc, 'button', '', 'Copy report');
+    const clearButton = makeElement(doc, 'button', '', 'Clear log');
+
+    copyButton.disabled = false;
+
+    actions.append(scanButton, copyButton, clearButton);
+
+    const status = makeElement(
+      doc,
+      'div',
+      'mm-scan-status',
+      'Ready. No scan has been run yet.'
+    );
+
+    const reportBox = makeElement(
+      doc,
+      'textarea',
+      'mm-scan-report'
+    );
+
+    reportBox.readOnly = true;
+    reportBox.setAttribute(
+      'aria-label',
+      'Standalone page scan report'
+    );
+    reportBox.placeholder = 'The scan report will appear here.';
+
+    const eventLog = makeElement(doc, 'div', 'mm-scan-log');
+
+    card.append(
+      style,
+      title,
+      note,
+      actions,
+      status,
+      reportBox,
+      eventLog
+    );
+
+    logsPane.appendChild(card);
+
+    let latestReport = '';
+    const events = [];
+
+    function renderEvents() {
+      eventLog.replaceChildren();
+
+      if (!events.length) {
+        eventLog.textContent = 'No events yet.';
+        return;
+      }
+
+      events.slice(-30).forEach(function (entry) {
+        const row = makeElement(
+          doc,
+          'div',
+          '',
+          '[' + entry.time + '] ' + entry.message
+        );
+
+        eventLog.appendChild(row);
       });
     }
 
-    render();
+    function log(message) {
+      events.push({
+        time: new Date().toLocaleTimeString(),
+        message: String(message)
+      });
+
+      if (events.length > 50) events.shift();
+
+      renderEvents();
+    }
+
+    function fullReport() {
+      const parts = [
+        latestReport ||
+          [
+            'MOO MACRO — STANDALONE READ-ONLY PAGE SCAN',
+            'Library: ' + VERSION,
+            'No scan has been run yet.'
+          ].join('\n')
+      ];
+
+      parts.push('', 'EVENT LOG');
+
+      if (!events.length) {
+        parts.push('(empty)');
+      } else {
+        events.forEach(function (entry) {
+          parts.push(
+            '[' + entry.time + '] ' + entry.message
+          );
+        });
+      }
+
+      return parts.join('\n');
+    }
+
+    scanButton.addEventListener('click', function () {
+      try {
+        const report = scanPage(win);
+
+        latestReport = formatReport(report);
+        reportBox.value = latestReport;
+
+        const candidateCount = report.stateCandidates.length;
+
+        status.textContent = report.publicHealthFieldFound
+          ? 'Scan complete: a public health-like field was found. Validation is still needed.'
+          : 'Scan complete: no public health field found in public globals.';
+
+        log('Read-only page scan completed.');
+        log('Candidate state objects: ' + candidateCount + '.');
+        log('No game actions or network inspection occurred.');
+      } catch (error) {
+        status.textContent =
+          'Scan failed: ' +
+          (error && error.message ? error.message : 'unknown error');
+
+        log(
+          'Scan failed: ' +
+          (error && error.message ? error.message : 'unknown error')
+        );
+      }
+    });
+
+    copyButton.addEventListener('click', async function () {
+      const report = fullReport();
+      reportBox.value = report;
+
+      try {
+        if (
+          !win.navigator ||
+          !win.navigator.clipboard ||
+          typeof win.navigator.clipboard.writeText !== 'function'
+        ) {
+          throw new Error(
+            'Clipboard API is unavailable. The report is shown in the text box.'
+          );
+        }
+
+        await win.navigator.clipboard.writeText(report);
+
+        status.textContent = 'Report copied.';
+        log('Report copied to clipboard.');
+      } catch (error) {
+        reportBox.focus();
+        reportBox.select();
+
+        status.textContent =
+          'Copy unavailable. The report is selected below; press Ctrl+C.';
+
+        log(
+          'Clipboard copy unavailable; report selected for manual copying.'
+        );
+      }
+    });
+
+    clearButton.addEventListener('click', function () {
+      events.length = 0;
+      renderEvents();
+      status.textContent = 'Log cleared.';
+    });
+
+    log('Moo Macro standalone scanner ' + VERSION + ' ready.');
+
+    if (removed) {
+      log('Removed ' + removed + ' Combat diagnostic card(s).');
+    } else {
+      log('No Combat diagnostic card found to remove.');
+    }
+
     return true;
   }
 
-  function boot() {
-    if (attachLogs()) return;
+  function autoAttach(win) {
+    if (!win || !win.document) return false;
 
-    const observer = new MutationObserver(() => {
-      if (attachLogs()) observer.disconnect();
+    if (mount(win)) return true;
+
+    const doc = win.document;
+    const Observer = win.MutationObserver;
+
+    if (typeof Observer !== 'function' || !doc.documentElement) {
+      return false;
+    }
+
+    const observer = new Observer(function () {
+      if (mount(win)) observer.disconnect();
     });
 
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true
-    });
+    try {
+      observer.observe(doc.documentElement, {
+        childList: true,
+        subtree: true
+      });
+
+      return true;
+    } catch (_) {
+      observer.disconnect();
+      return false;
+    }
   }
 
-  window.MooMacroLib = Object.freeze({
+  return Object.freeze({
     version: VERSION,
-    connect,
-    getState: state,
-    report: makeReport
+    scanPage: scanPage,
+    formatReport: formatReport,
+    removeCombatDiagnostic: removeCombatDiagnostic,
+    mount: mount,
+    autoAttach: autoAttach
   });
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot, { once: true });
-  } else {
-    boot();
-  }
-
-  // Automatic read-only connection attempt.
-  connect().catch(() => {});
-})();
+});
